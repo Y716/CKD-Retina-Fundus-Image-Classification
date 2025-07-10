@@ -3,9 +3,6 @@ import torch.nn as nn
 from torchvision import datasets, models, transforms
 from torch.utils.data import DataLoader
 import os
-import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
 
 # CONFIG
 VAL_DIR = 'data/val'
