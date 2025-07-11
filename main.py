@@ -7,7 +7,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
 from PIL import ImageFile
-from torch.utils.data import random_split
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
 
 # Prevent crash from truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -17,7 +19,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # =========================
 
 CONFIG = {
-    'model_list': ['resnet_18', 'swin_t', 'vgg16', 'densenet121', 'efficientnet_b0'],
+    'model_list': ['mobilenet_v2', 'swin_t', 'vgg16', 'densenet121', 'efficientnet_b0'],
     'batch_size': 8,
     'epochs': 10,
     'learning_rate': 1e-4,
@@ -26,7 +28,7 @@ CONFIG = {
     'wandb_project': 'klasifikasi-fundus-retina'
 }
 
-DATASET_DIR = os.path.join('dataset')
+DATASET_DIR = os.path.join('dataset/kaggleDataset')
 MODEL_DIR = 'models'
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -51,17 +53,17 @@ data_transforms = {
     ]),
 }
 
-# Load full dataset from class-labeled folders
-full_dataset = datasets.ImageFolder(DATASET_DIR, transform=data_transforms['train'])  # transform only used as placeholder
+full_dataset = datasets.ImageFolder(DATASET_DIR, transform=data_transforms['train']) 
 
 # Train-val split
-train_size = int(0.8 * len(full_dataset))
-val_size = len(full_dataset) - train_size
-train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+image_paths = [s[0] for s in full_dataset.samples]
+labels = [s[1] for s in full_dataset.samples]
 
 # Update transforms (ImageFolder doesn't transform split subsets directly)
-train_dataset.dataset.transform = data_transforms['train']
-val_dataset.dataset.transform = data_transforms['val']
+StartSplit = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+for train_idx, val_idx in StartSplit.split(image_paths, labels):
+    train_dataset = torch.utils.data.Subset(full_dataset, train_idx)
+    val_dataset = torch.utils.data.Subset(full_dataset, val_idx)
 
 # Dataloaders
 train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=CONFIG['num_workers'])
@@ -89,9 +91,12 @@ def get_model(name, num_classes):
     elif name == 'swin_t':
         model = models.swin_t(weights=models.Swin_T_Weights.DEFAULT)
         model.head = nn.Linear(model.head.in_features, num_classes)
-    elif name == 'resnet_18':
-        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
+    elif name == 'mobilenet_v2':
+        model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
+        model.classifier = nn.Sequential(
+            nn.Dropout(),
+            nn.Linear(model.last_channel, num_classes),
+        )
     else:
         raise ValueError(f'Unsupported model: {name}')
     return model.to(device)
@@ -100,8 +105,9 @@ def get_model(name, num_classes):
 # TRAINING FUNCTION
 # =========================
 
-def train_model(model, model_name, criterion, optimizer, num_epochs):
+def train_model(model, model_name, criterion, optimizer, num_epochs, patience=3):
     best_acc = 0.0
+    no_improve_epochs = 0
 
     for epoch in range(num_epochs):
         print(f'\nEpoch {epoch+1}/{num_epochs}')
@@ -136,12 +142,51 @@ def train_model(model, model_name, criterion, optimizer, num_epochs):
                        f'{phase}_acc': epoch_acc,
                        'epoch': epoch+1})
 
-            if phase == 'val' and epoch_acc > best_acc:
-                best_acc = epoch_acc
-                torch.save(model.state_dict(), os.path.join(MODEL_DIR, f'{model_name}_best.pth'))
-                print(f'✅ Best model saved: {model_name}_best.pth — Acc: {best_acc:.4f}')
+            if phase == 'val':
+                if epoch_acc > best_acc:
+                    best_acc = epoch_acc
+                    no_improve_epochs = 0
+                    torch.save(model.state_dict(), os.path.join(MODEL_DIR, f'{model_name}_best.pth'))
+                    print(f'✅ Best model saved: {model_name}_best.pth — Acc: {best_acc:.4f}')
+                else:
+                    no_improve_epochs += 1
+                    if no_improve_epochs >= patience:
+                        print(f'⏹️ Early stopping triggered at epoch {epoch+1}')
+                        return best_acc
 
     return best_acc
+
+# =========================
+# CONFUSION MATRIX
+# =========================
+def plot_confusion_matrix(model, dataloader, model_name):
+    model.eval()
+    all_preds, all_labels = [], []
+    
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.numpy())
+            
+    cm = confusion_matrix(all_labels, all_preds)
+    
+    wandb.log({
+        f"{model_name}/confusion_matrix": wandb.plot.confusion_matrix(
+            probs=None,
+            y_true=all_labels,
+            preds=all_preds,
+            class_names=class_names
+        )
+    })
+    
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    disp.plot(cmap = plt.cm.Blues)
+    plt.title(f'Confusion Matrix - {model_name}')
+    plt.show()
+
 
 # =========================
 # MAIN LOOP FOR ALL MODELS
@@ -157,7 +202,7 @@ if __name__ == '__main__':
         optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
 
         acc = train_model(model, model_name, criterion, optimizer, CONFIG['epochs'])
-
+        plot_confusion_matrix(model, val_loader, model_name)
         wandb.run.summary[f'{model_name}_val_acc'] = acc
         wandb.finish()
 
