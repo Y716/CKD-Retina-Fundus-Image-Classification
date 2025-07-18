@@ -2,3 +2,6 @@ data/
 dataset/
 wandb/
 models/
+gan_weights/
+split_dataset
+augmented_preview/

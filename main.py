@@ -1,209 +1,201 @@
+# full_pipeline_with_albumentations.py
+# =========================================================
+#  End‑to‑end pipeline:
+#  1.  Albumentations‑based data augmentation
+#  2.  Stratified train/val split
+#  3.  Preview & save augmented samples (optional)
+#  4.  Multi‑model training + early‑stopping
+#  5.  Confusion‑matrix logging to WandB (figure + interactive)
+# =========================================================
+import matplotlib.pyplot as plt
+import random
 import os
+import cv2
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
+from torchvision.datasets import ImageFolder
+from torchvision import models
 from tqdm import tqdm
 import wandb
-from PIL import ImageFile
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
-import matplotlib.pyplot as plt
-
-# Prevent crash from truncated images
+from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# =========================
-# CONFIGURATION
-# =========================
-
+# ---------------- CONFIG ----------------
 CONFIG = {
-    'model_list': ['mobilenet_v2', 'swin_t', 'vgg16', 'densenet121', 'efficientnet_b0'],
-    'batch_size': 8,
-    'epochs': 10,
-    'learning_rate': 1e-4,
-    'img_size': 224,
-    'num_workers': 2,
-    'wandb_project': 'klasifikasi-fundus-retina'
+    'dataset_dir'   : 'dataset/kaggleDataset',   # root with class folders
+    'preview_dir'   : 'augmented_preview',       # folder to save sample aug images
+    'preview_limit' : 100,                       # max preview images to save
+    'model_list'    : ['mobilenet_v2', 'swin_t', 'vgg16', 'densenet121', 'efficientnet_b0'],
+    'batch_size'    : 8,
+    'epochs'        : 10,
+    'patience'      : 3,                         # early‑stopping
+    'learning_rate' : 1e-4,
+    'img_size'      : 224,
+    'num_workers'   : 2,
+    'project'       : 'klasifikasi-fundus-retina'
 }
-
-DATASET_DIR = os.path.join('dataset/kaggleDataset')
+os.makedirs(CONFIG['preview_dir'], exist_ok=True)
 MODEL_DIR = 'models'
 os.makedirs(MODEL_DIR, exist_ok=True)
-
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f'Using device: {device}')
+print('Device:', device)
 
-# =========================
-# DATASET & TRANSFORMS
-# =========================
-
-data_transforms = {
-    'train': transforms.Compose([
-        transforms.Resize((CONFIG['img_size'], CONFIG['img_size'])),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5])
+# ---------------- Albumentations transform ----------------
+alb_transforms = {
+    'train': A.Compose([
+        A.Resize(256, 256),
+        A.RandomCrop(CONFIG['img_size'], CONFIG['img_size']),
+        A.HorizontalFlip(p=0.5),
+        A.RandomBrightnessContrast(p=0.2),
+        A.ElasticTransform(alpha=50, sigma=5, p=0.3),
+        A.Normalize(mean=[0.5]*3, std=[0.5]*3),
+        ToTensorV2(),
     ]),
-    'val': transforms.Compose([
-        transforms.Resize((CONFIG['img_size'], CONFIG['img_size'])),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5])
+    'val'  : A.Compose([
+        A.Resize(CONFIG['img_size'], CONFIG['img_size']),
+        A.Normalize(mean=[0.5]*3, std=[0.5]*3),
+        ToTensorV2(),
     ]),
 }
 
-full_dataset = datasets.ImageFolder(DATASET_DIR, transform=data_transforms['train']) 
+# ---------------- Custom Dataset ----------------
+class AlbumentationDataset(Dataset):
+    def __init__(self, img_paths, labels, transform, preview=False):
+        self.img_paths, self.labels = img_paths, labels
+        self.transform = transform
+        self.preview    = preview
+        self._saved_cnt = 0
 
-# Train-val split
-image_paths = [s[0] for s in full_dataset.samples]
-labels = [s[1] for s in full_dataset.samples]
+    def __len__(self): return len(self.img_paths)
 
-# Update transforms (ImageFolder doesn't transform split subsets directly)
-StartSplit = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-for train_idx, val_idx in StartSplit.split(image_paths, labels):
-    train_dataset = torch.utils.data.Subset(full_dataset, train_idx)
-    val_dataset = torch.utils.data.Subset(full_dataset, val_idx)
+    def __getitem__(self, idx):
+        img = cv2.imread(self.img_paths[idx])
+        if img is None:
+            raise FileNotFoundError(f'Cannot read {self.img_paths[idx]}')
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-# Dataloaders
-train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=CONFIG['num_workers'])
-val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=CONFIG['num_workers'])
+        augmented = self.transform(image=img)
+        tensor_img = augmented['image']
 
-# Class names from ImageFolder
-class_names = full_dataset.classes
-print('Classes:', class_names)
+        # save preview
+        if self.preview and self._saved_cnt < CONFIG['preview_limit']:
+            bgr = cv2.cvtColor(tensor_img.permute(1,2,0).cpu().numpy()*0.5+0.5, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(os.path.join(CONFIG['preview_dir'], f'aug_{self._saved_cnt}.png'),
+                        (bgr*255).astype('uint8'))
+            self._saved_cnt += 1
+        return tensor_img, torch.tensor(self.labels[idx], dtype=torch.long)
 
+# ---------------- Build dataset ----------------
+full = ImageFolder(CONFIG['dataset_dir'])
+img_paths = [s[0] for s in full.samples]
+labels    = [s[1] for s in full.samples]
+class_names = full.classes
 
-# =========================
-# MODEL SELECTOR
-# =========================
+sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+for train_idx, val_idx in sss.split(img_paths, labels):
+    train_paths = [img_paths[i] for i in train_idx]
+    val_paths   = [img_paths[i] for i in val_idx]
+    train_lbls  = [labels[i]   for i in train_idx]
+    val_lbls    = [labels[i]   for i in val_idx]
 
-def get_model(name, num_classes):
-    if name == 'efficientnet_b0':
-        model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
-        model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
-    elif name == 'densenet121':
-        model = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
-        model.classifier = nn.Linear(model.classifier.in_features, num_classes)
-    elif name == 'vgg16':
-        model = models.vgg16(weights=models.VGG16_Weights.DEFAULT)
-        model.classifier[6] = nn.Linear(model.classifier[6].in_features, num_classes)
-    elif name == 'swin_t':
-        model = models.swin_t(weights=models.Swin_T_Weights.DEFAULT)
-        model.head = nn.Linear(model.head.in_features, num_classes)
-    elif name == 'mobilenet_v2':
-        model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
-        model.classifier = nn.Sequential(
-            nn.Dropout(),
-            nn.Linear(model.last_channel, num_classes),
-        )
+train_ds = AlbumentationDataset(train_paths, train_lbls, alb_transforms['train'], preview=True)
+val_ds   = AlbumentationDataset(val_paths,   val_lbls,   alb_transforms['val'],   preview=False)
+train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True,
+                          num_workers=CONFIG['num_workers'])
+val_loader   = DataLoader(val_ds,   batch_size=CONFIG['batch_size'], shuffle=False,
+                          num_workers=CONFIG['num_workers'])
+
+# ---------------- Model selector ----------------
+def get_model(name, num_cls):
+    if name=='efficientnet_b0':
+        m=models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        m.classifier[1]=nn.Linear(m.classifier[1].in_features,num_cls)
+    elif name=='densenet121':
+        m=models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+        m.classifier=nn.Linear(m.classifier.in_features,num_cls)
+    elif name=='vgg16':
+        m=models.vgg16(weights=models.VGG16_Weights.DEFAULT)
+        m.classifier[6]=nn.Linear(m.classifier[6].in_features,num_cls)
+    elif name=='swin_t':
+        m=models.swin_t(weights=models.Swin_T_Weights.DEFAULT)
+        m.head=nn.Linear(m.head.in_features,num_cls)
+    elif name=='mobilenet_v2':
+        m=models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
+        m.classifier=nn.Sequential(nn.Dropout(),nn.Linear(m.last_channel,num_cls))
     else:
-        raise ValueError(f'Unsupported model: {name}')
-    return model.to(device)
+        raise ValueError(name)
+    return m.to(device)
 
-# =========================
-# TRAINING FUNCTION
-# =========================
-
-def train_model(model, model_name, criterion, optimizer, num_epochs, patience=3):
-    best_acc = 0.0
-    no_improve_epochs = 0
-
-    for epoch in range(num_epochs):
-        print(f'\nEpoch {epoch+1}/{num_epochs}')
-        for phase in ['train', 'val']:
-            model.train() if phase == 'train' else model.eval()
-            dataloader = train_loader if phase == 'train' else val_loader
-
-            running_loss = 0.0
-            running_corrects = 0
-
-            for inputs, labels in tqdm(dataloader, desc=f"{model_name.upper()} - {phase.capitalize()} Epoch {epoch+1}"):
-                inputs, labels = inputs.to(device), labels.to(device)
-                optimizer.zero_grad()
-
-                with torch.set_grad_enabled(phase == 'train'):
-                    outputs = model(inputs)
-                    _, preds = torch.max(outputs, 1)
-                    loss = criterion(outputs, labels)
-
-                    if phase == 'train':
+# ---------------- Train, Early‑stop, Conf‑matrix ----------------
+def train_one(model, name):
+    optim_ = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
+    crit   = nn.CrossEntropyLoss()
+    best, patience=0,0
+    for ep in range(CONFIG['epochs']):
+        for phase in ('train','val'):
+            model.train() if phase=='train' else model.eval()
+            loader = train_loader if phase=='train' else val_loader
+            run_loss, run_correct=0,0
+            for x,y in tqdm(loader, desc=f'{name}-{phase}-E{ep+1}'):
+                x,y=x.to(device),y.to(device)
+                if phase=='train': 
+                    optim_.zero_grad()
+                with torch.set_grad_enabled(phase=='train'):
+                    out=model(x)
+                    loss=crit(out,y) 
+                    preds=out.argmax(1)
+                    if phase=='train': 
                         loss.backward()
-                        optimizer.step()
-
-                running_loss += loss.item() * inputs.size(0)
-                running_corrects += torch.sum(preds == labels.data)
-
-            epoch_loss = running_loss / len(dataloader.dataset)
-            epoch_acc = running_corrects.double() / len(dataloader.dataset)
-
-            print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
-            wandb.log({f'{phase}_loss': epoch_loss,
-                       f'{phase}_acc': epoch_acc,
-                       'epoch': epoch+1})
-
-            if phase == 'val':
-                if epoch_acc > best_acc:
-                    best_acc = epoch_acc
-                    no_improve_epochs = 0
-                    torch.save(model.state_dict(), os.path.join(MODEL_DIR, f'{model_name}_best.pth'))
-                    print(f'✅ Best model saved: {model_name}_best.pth — Acc: {best_acc:.4f}')
+                        optim_.step()
+                run_loss+=loss.item()*x.size(0)
+                run_correct+=(preds==y).sum().item()
+            ep_loss=run_loss/len(loader.dataset)
+            ep_acc =run_correct/len(loader.dataset)
+            wandb.log({f'{name}/{phase}_loss':ep_loss,
+                       f'{name}/{phase}_acc':ep_acc,'epoch':ep+1})
+            print(f'{phase} - loss:{ep_loss:.4f} acc:{ep_acc:.4f}')
+            if phase=='val':
+                if ep_acc>best:
+                    best=ep_acc
+                    patience=0
+                    torch.save(model.state_dict(),f'{MODEL_DIR}/{name}_best.pth')
                 else:
-                    no_improve_epochs += 1
-                    if no_improve_epochs >= patience:
-                        print(f'⏹️ Early stopping triggered at epoch {epoch+1}')
-                        return best_acc
+                    patience+=1
+        if patience>=CONFIG['patience']:
+            print('Early stop')
+            break
+    return best
 
-    return best_acc
-
-# =========================
-# CONFUSION MATRIX
-# =========================
-def plot_confusion_matrix(model, dataloader, model_name):
+def log_conf_matrix(model,name):
     model.eval()
-    all_preds, all_labels = [], []
-    
+    all_p,all_l=[],[]
     with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs = inputs.to(device)
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.numpy())
-            
-    cm = confusion_matrix(all_labels, all_preds)
-    
-    wandb.log({
-        f"{model_name}/confusion_matrix": wandb.plot.confusion_matrix(
-            probs=None,
-            y_true=all_labels,
-            preds=all_preds,
-            class_names=class_names
-        )
-    })
-    
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
-    disp.plot(cmap = plt.cm.Blues)
-    plt.title(f'Confusion Matrix - {model_name}')
-    plt.show()
+        for x,y in val_loader:
+            p=model(x.to(device)).argmax(1).cpu()
+            all_p+=p.tolist()
+            all_l+=y.tolist()
+    cm = confusion_matrix(all_l, all_p)
+    fig,ax=plt.subplots(figsize=(6,6))
+    disp=ConfusionMatrixDisplay(cm,display_labels=class_names)
+    disp.plot(ax=ax,cmap=plt.cm.Blues)
+    plt.title(name)
+    wandb.log({f'{name}/conf_mat_plot': wandb.Image(fig),
+               f'{name}/conf_mat': wandb.plot.confusion_matrix(
+                   y_true=all_l, preds=all_p, class_names=class_names)})
+    plt.close(fig)
 
-
-# =========================
-# MAIN LOOP FOR ALL MODELS
-# =========================
-
-if __name__ == '__main__':
-    for model_name in CONFIG['model_list']:
-        print(f'\n🔁 Starting training for model: {model_name}')
-        wandb.init(project=CONFIG['wandb_project'], name=f'{model_name}_training', config={**CONFIG, 'model_name': model_name})
-
-        model = get_model(model_name, len(class_names))
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
-
-        acc = train_model(model, model_name, criterion, optimizer, CONFIG['epochs'])
-        plot_confusion_matrix(model, val_loader, model_name)
-        wandb.run.summary[f'{model_name}_val_acc'] = acc
-        wandb.finish()
-
-    print("✅ All models trained!")
+# ---------------- Main loop ----------------
+for mdl in CONFIG['model_list']:
+    wandb.init(project=CONFIG['project'], name=f'{mdl}_run', config=CONFIG)
+    net=get_model(mdl,len(class_names))
+    best_acc=train_one(net,mdl)
+    log_conf_matrix(net,mdl)
+    wandb.summary[f'{mdl}_best_acc']=best_acc
+    wandb.finish()
+print('✅ Finished all trainings')

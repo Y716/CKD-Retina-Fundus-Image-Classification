@@ -1,41 +1,49 @@
 import os
 import shutil
-import pandas as pd
+import random
+from tqdm import tqdm
 
-# Reload the CSV just in case
-csv_path = "data/Training_Set/RFMiD_Training_Labels.csv"
+# ===== CONFIGURATION =====
+SOURCE_DIR = 'dataset/kaggleDataset'  # original dataset with class folders
+DEST_DIR = 'split_dataset'  # destination folder to save train/ and test/
+SPLIT_RATIO = 0.8  # 80% train, 20% test
+SEED = 42
 
-df = pd.read_csv(csv_path)
+random.seed(SEED)
 
-# Paths setup (you can modify these)
-source_image_dir = 'data/Training_Set/Training'  # Folder where all images are located (e.g., 1.jpg, 2.jpg)
-output_dir = 'data'
-train_dir = os.path.join(output_dir, 'train')
-val_dir = os.path.join(output_dir, 'val')
+# ===== FUNCTION TO SPLIT DATASET =====
+def split_and_save_dataset():
+    class_names = os.listdir(SOURCE_DIR)
+    class_names = [cls for cls in class_names if os.path.isdir(os.path.join(SOURCE_DIR, cls))]
 
-# Create output folders
-for split in [train_dir, val_dir]:
-    os.makedirs(os.path.join(split, 'normal'), exist_ok=True)
-    os.makedirs(os.path.join(split, 'diseased'), exist_ok=True)
+    for cls in tqdm(class_names, desc="Splitting classes"):
+        cls_source_path = os.path.join(SOURCE_DIR, cls)
+        images = [f for f in os.listdir(cls_source_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        random.shuffle(images)
 
-# Shuffle and split (80% train, 20% val)
-df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-split_idx = int(len(df) * 0.8)
-train_df = df[:split_idx]
-val_df = df[split_idx:]
+        split_idx = int(len(images) * SPLIT_RATIO)
+        train_imgs = images[:split_idx]
+        test_imgs = images[split_idx:]
 
-# Function to copy images
-def copy_images(dataframe, split_dir):
-    for _, row in dataframe.iterrows():
-        image_filename = f"{row['ID']}.png"
-        label = 'diseased' if row['Disease_Risk'] == 1 else 'normal'
-        src = os.path.join(source_image_dir, image_filename)
-        dst = os.path.join(split_dir, label, image_filename)
-        if os.path.exists(src):  # Only copy if image file exists
+        # Paths to save
+        train_cls_path = os.path.join(DEST_DIR, 'train', cls)
+        test_cls_path = os.path.join(DEST_DIR, 'test', cls)
+        os.makedirs(train_cls_path, exist_ok=True)
+        os.makedirs(test_cls_path, exist_ok=True)
+
+        # Copy files
+        for img in train_imgs:
+            src = os.path.join(cls_source_path, img)
+            dst = os.path.join(train_cls_path, img)
             shutil.copyfile(src, dst)
 
-# Copy images
-copy_images(train_df, train_dir)
-copy_images(val_df, val_dir)
+        for img in test_imgs:
+            src = os.path.join(cls_source_path, img)
+            dst = os.path.join(test_cls_path, img)
+            shutil.copyfile(src, dst)
 
-output_dir
+    print("✅ Dataset successfully split into train/test folders.")
+
+# ===== EXECUTE =====
+if __name__ == '__main__':
+    split_and_save_dataset()

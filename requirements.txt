@@ -4,4 +4,4 @@ lightning
 wandb
 scikit-learn
 pillow
-
+albumentationsx
