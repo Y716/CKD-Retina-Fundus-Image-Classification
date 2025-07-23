@@ -5,3 +5,6 @@ models/
 gan_weights/
 split_dataset
 augmented_preview/
+lightning_logs/
+fundus-classification/
+model/
