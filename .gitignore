@@ -7,3 +7,4 @@ split_dataset
 augmented_preview/
 lightning_logs/
 fundus-classification/
+checkpoints/

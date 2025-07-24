@@ -10,9 +10,10 @@ from lightning.pytorch.callbacks import (
     EarlyStopping, 
     LearningRateMonitor, 
     ModelCheckpoint,
-    RichProgressBar,
     TQDMProgressBar
 )
+import random
+import string
 from rich.console import Console
 from rich.table import Table
 
@@ -57,6 +58,36 @@ class CustomProgressBar(TQDMProgressBar):
             table.add_row(name, f"{value:.4f}")
             
         console.print(table)
+
+class StorageOptimizedModelCheckpoint(ModelCheckpoint):
+    """Custom ModelCheckpoint that logs artifact references instead of uploading models"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        """Override to log a reference to the model instead of uploading it"""
+        result = super().on_save_checkpoint(trainer, pl_module, checkpoint)
+        
+        # If this is the best model so far and we have a logger
+        if hasattr(self, "best_model_path") and self.best_model_path and trainer.logger and hasattr(trainer.logger, "experiment"):
+            try:
+                # Log the model path as an artifact reference
+                artifact = wandb.Artifact(
+                    name=f"model-{trainer.logger.experiment.id}", 
+                    type="model",
+                    description=f"Best model checkpoint (val_loss={self.best_model_score:.4f})"
+                )
+                
+                # Add a reference instead of uploading the file
+                artifact.add_reference(self.best_model_path, name="best_model.ckpt")
+                
+                # Log the artifact
+                trainer.logger.experiment.log_artifact(artifact)
+                console.print(f"[green]Logged model reference to WandB: {self.best_model_path}[/green]")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not log model reference to WandB: {e}[/yellow]")
+                
+        return result
 
 def main():
     # Set up argument parser with more options
@@ -105,6 +136,15 @@ def main():
                         help="Comma-separated tags for this run")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
                         help="Directory to save checkpoints")
+    parser.add_argument("--upload_models", action="store_true",
+                        help="Upload model checkpoints to WandB (uses more storage)")
+    parser.add_argument("--save_top_k", type=int, default=1,
+                        help="Number of best models to save")
+    parser.add_argument("--wandb_mode", type=str, default="online", 
+                        choices=["online", "offline", "disabled"],
+                        help="WandB logging mode")
+    parser.add_argument("--reduced_logging", action="store_true",
+                        help="Reduce amount of data logged to WandB")
     
     # Parse arguments
     args = parser.parse_args()
@@ -125,20 +165,25 @@ def main():
     
     # Generate run name if not provided
     if args.run_name is None:
+        # Create a unique ID
+        unique_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        args.run_name = f"{args.model_name}_{timestamp}"
+        args.run_name = f"{args.model_name}_{timestamp}_{unique_id}"
     
     # Parse tags
     tags = None
     if args.tags:
         tags = [tag.strip() for tag in args.tags.split(",")]
     
+    # Set WandB mode
+    os.environ["WANDB_MODE"] = args.wandb_mode
+    
     # Initialize WandB logger
     wandb_logger = WandbLogger(
         project="fundus-classification",
         name=args.run_name,
         tags=tags,
-        log_model="all",
+        log_model="all" if args.upload_models else None,  # Only upload models if requested
         config=vars(args)
     )
     
@@ -158,7 +203,8 @@ def main():
         in_channels=args.in_channels,
         loss_fn=loss_fn,
         metric_fn=classification_metrics,
-        lr=args.lr
+        lr=args.lr,
+        weight_decay=args.weight_decay,
     )
     
     # Print model summary
@@ -186,15 +232,42 @@ def main():
             verbose=True
         ),
         LearningRateMonitor(logging_interval="epoch"),
-        ModelCheckpoint(
+    ]
+    
+    # Use storage-optimized checkpoint callback unless explicitly uploading models
+    if args.upload_models:
+        callbacks.append(ModelCheckpoint(
             dirpath=os.path.join(args.checkpoint_dir, args.run_name),
-            filename="{epoch}-{val_loss:.4f}-{val_accuracy:.4f}",
+            filename="{epoch}-{val_loss:.4f}",
             monitor="val_loss",
             mode="min",
-            save_top_k=3,
+            save_top_k=args.save_top_k,
             verbose=True
-        )
-    ]
+        ))
+    else:
+        callbacks.append(StorageOptimizedModelCheckpoint(
+            dirpath=os.path.join(args.checkpoint_dir, args.run_name),
+            filename="{epoch}-{val_loss:.4f}",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=args.save_top_k,
+            verbose=True
+        ))
+    
+    # Reduce image logging frequency if requested
+    if args.reduced_logging:
+        # Monkey patch the model's on_validation_epoch_end to log less frequently
+        original_fn = model.on_validation_epoch_end
+        def reduced_logging_fn(self):
+            # Only log confusion matrix every 5 epochs or on last epoch
+            if self.current_epoch % 5 == 0 or self.current_epoch == self.trainer.max_epochs - 1:
+                original_fn()
+            else:
+                # Skip logging confusion matrix
+                self.val_targets = []
+                self.val_preds = []
+        
+        model.on_validation_epoch_end = reduced_logging_fn.__get__(model, model.__class__)
     
     # Initialize trainer
     console.print("[bold]Initializing PyTorch Lightning Trainer...[/bold]")
@@ -202,7 +275,7 @@ def main():
         max_epochs=args.max_epochs,
         logger=wandb_logger,
         callbacks=callbacks,
-        log_every_n_steps=10,
+        log_every_n_steps=50 if args.reduced_logging else 10,  # Log less frequently if requested
         accelerator="auto",
         devices=1,
         strategy="auto"
