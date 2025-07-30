@@ -4,10 +4,6 @@ import torch.nn as nn
 import timm
 import torchmetrics
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import wandb
-from sklearn.metrics import confusion_matrix
 
 
 class ClassificationModel(pl.LightningModule):
@@ -49,90 +45,79 @@ class ClassificationModel(pl.LightningModule):
         self.val_acc = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
         
         # For optional confusion matrix
-        self.val_targets = []
-        self.val_preds = []
         self.num_classes = num_classes
-        self._log_confusion_matrix = False
 
     def forward(self, x):
         return self.model(x)
+    
+    def _process_batch(self, batch):
+        """Safely process batch data regardless of format"""
+        # Handle different batch formats
+        if isinstance(batch, (list, tuple)):
+            if len(batch) == 2:
+                return batch[0], batch[1]
+            elif len(batch) > 2:
+                # If more than 2 elements, take first two
+                print(f"Warning: Batch has {len(batch)} elements, using first two")
+                return batch[0], batch[1]
+            else:
+                raise ValueError(f"Batch has only {len(batch)} elements, expected at least 2")
+        elif isinstance(batch, dict):
+            # Handle dict format
+            if 'image' in batch and 'label' in batch:
+                return batch['image'], batch['label']
+            elif 'images' in batch and 'labels' in batch:
+                return batch['images'], batch['labels']
+            else:
+                raise ValueError(f"Dict batch missing expected keys: {batch.keys()}")
+        else:
+            raise ValueError(f"Unexpected batch type: {type(batch)}")
 
     def training_step(self, batch, batch_idx):
-        x, y = batch
-        logits = self(x)
-        loss = self.loss_fn(logits, y)
-        
-        # Calculate accuracy
-        preds = torch.argmax(logits, dim=1)
-        acc = self.train_acc(preds, y)
-        
-        # Log only essential metrics
-        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("train_acc", acc, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        try:
+            x, y = self._process_batch(batch)
+            logits = self(x)
+            loss = self.loss_fn(logits, y)
+            
+            # Calculate accuracy
+            preds = torch.argmax(logits, dim=1)
+            acc = self.train_acc(preds, y)
+            
+            # Log only essential metrics
+            self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            self.log("train_acc", acc, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
 
-        return loss
+            return loss
+        except Exception as e:
+            print(f"Error in training_step: {e}")
+            print(f"Batch type: {type(batch)}")
+            if isinstance(batch, (list, tuple)):
+                print(f"Batch length: {len(batch)}")
+            raise
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
-        logits = self(x)
-        loss = self.loss_fn(logits, y)
-        
-        # Calculate predictions
-        preds = torch.argmax(logits, dim=1)
-        
-        # Store for confusion matrix if enabled
-        if self._log_confusion_matrix:
-            self.val_targets.append(y.cpu())
-            self.val_preds.append(preds.cpu())
-        
-        # Update accuracy
-        acc = self.val_acc(preds, y)
-        
-        # Log only essential metrics
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("val_acc", acc, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-
-        return {"val_loss": loss}
-
-    def on_validation_epoch_end(self):
-        """Optionally calculate and log confusion matrix"""
-        if not self._log_confusion_matrix or not self.val_targets:
-            self.val_targets = []
-            self.val_preds = []
-            return
-            
         try:
-            # Only log confusion matrix on last epoch to save storage
-            if self.current_epoch == self.trainer.max_epochs - 1:
-                targets = torch.cat(self.val_targets).numpy()
-                preds = torch.cat(self.val_preds).numpy()
-                
-                cm = confusion_matrix(targets, preds, labels=list(range(self.num_classes)))
-                
-                # Create simple confusion matrix plot
-                fig, ax = plt.subplots(figsize=(8, 6), dpi=100)
-                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=False)
-                ax.set_xlabel('Predicted')
-                ax.set_ylabel('Actual')
-                ax.set_title('Confusion Matrix')
-                
-                # Log to wandb
-                if self.logger and hasattr(self.logger, 'experiment'):
-                    self.logger.experiment.log({
-                        "confusion_matrix": wandb.Image(fig),
-                        "epoch": self.current_epoch
-                    })
-                
-                plt.close(fig)
+            x, y = self._process_batch(batch)
+            logits = self(x)
+            loss = self.loss_fn(logits, y)
             
-            # Clear stored predictions
-            self.val_targets = []
-            self.val_preds = []
+            # Calculate predictions
+            preds = torch.argmax(logits, dim=1)
             
+            # Update accuracy
+            acc = self.val_acc(preds, y)
+            
+            # Log only essential metrics
+            self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+            self.log("val_acc", acc, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+
+            return {"val_loss": loss}
         except Exception as e:
-            print(f"Warning: Could not log confusion matrix: {e}")
-            self.val_targets = []
-            self.val_preds = []
+            print(f"Error in validation_step: {e}")
+            print(f"Batch type: {type(batch)}")
+            if isinstance(batch, (list, tuple)):
+                print(f"Batch length: {len(batch)}")
+            raise
 
     def configure_optimizers(self):
         # Configure optimizer
@@ -196,3 +181,7 @@ class ClassificationModel(pl.LightningModule):
             
         else:
             return optimizer
+            
+    def on_validation_epoch_end(self):
+        """Empty by default - no confusion matrix to save storage"""
+        pass

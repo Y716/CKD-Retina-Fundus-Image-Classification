@@ -1,0 +1,23 @@
+{
+  "description": "Benchmark experiment comparing different pretrained models from TIMM",
+  "experiment_name": "benchmark_models",
+  "parameters": {
+    "model_name": [
+      "mobilenetv2_100",
+      "efficientnet_b0", 
+      "vgg16",
+      "densenet121",
+      "resnet50"
+    ]
+  },
+  "fixed_parameters": {
+    "batch_size": 32,
+    "lr": 0.001,
+    "loss": "ce",
+    "max_epochs": 30,
+    "early_stopping": 10,
+    "img_size": 224,
+    "num_workers": 4,
+    "pretrained": true
+  }
+}

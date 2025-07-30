@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Script to run multiple experiments with different configurations.
-This is useful for hyperparameter tuning and model selection.
+Automatically handles experiment naming and parameter combinations.
 """
 
 import subprocess
@@ -13,10 +13,7 @@ import time
 from datetime import datetime
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
-from rich.panel import Panel
-from rich.live import Live
-from rich.layout import Layout
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 import signal
 import sys
 
@@ -26,38 +23,25 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run multiple fundus classification experiments")
     parser.add_argument("--config", type=str, required=True, 
                         help="Path to JSON config file with experiment parameters")
-    parser.add_argument("--experiment_name", type=str, default=None,
-                        help="Name for this experiment group")
-    parser.add_argument("--wandb_project", type=str, default="fundus-classification",
-                        help="WandB project name")
-    parser.add_argument("--sequential", action="store_true",
-                        help="Run experiments sequentially instead of generating commands")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Show detailed output from each experiment")
+    parser.add_argument("--sequential", action="store_true", default=True,
+                        help="Run experiments sequentially (default: True)")
     parser.add_argument("--dry_run", action="store_true",
                         help="Just print commands without executing them")
-    parser.add_argument("--use_optimized", action="store_true",
-                        help="Use the storage-optimized training script")
+    parser.add_argument("--gpu", type=int, default=0,
+                        help="GPU device to use")
     return parser.parse_args()
 
 def load_config(config_path):
-    """Load configuration from JSON file with error handling"""
+    """Load configuration from JSON file"""
     console.print(f"[bold cyan]Loading configuration from {config_path}[/bold cyan]")
     try:
         with open(config_path, 'r') as f:
             config = json.load(f)
         
-        # Validate required fields
         if "parameters" not in config:
             raise ValueError("Config must contain a 'parameters' field")
             
         return config
-    except FileNotFoundError:
-        console.print(f"[bold red]Error: Config file {config_path} not found[/bold red]")
-        sys.exit(1)
-    except json.JSONDecodeError:
-        console.print(f"[bold red]Error: Config file {config_path} is not valid JSON[/bold red]")
-        sys.exit(1)
     except Exception as e:
         console.print(f"[bold red]Error loading config: {e}[/bold red]")
         sys.exit(1)
@@ -67,268 +51,270 @@ def generate_experiment_combinations(config):
     console.print("[bold cyan]Generating experiment combinations...[/bold cyan]")
     
     # Extract parameter values to sweep
-    param_dict = {}
-    for param, values in config["parameters"].items():
-        param_dict[param] = values
+    param_dict = config["parameters"]
     
-    # Generate all combinations
-    keys = param_dict.keys()
-    values = param_dict.values()
-    combinations = list(itertools.product(*values))
-    
-    # Convert to list of parameter dictionaries
-    experiments = []
-    for combination in combinations:
-        experiment = dict(zip(keys, combination))
+    # Handle special case where focal_gamma should only be used with focal loss
+    if "loss" in param_dict and "focal_gamma" in param_dict:
+        combinations = []
+        focal_gammas = param_dict.pop("focal_gamma")
         
-        # Add fixed parameters if they exist
+        # Generate base combinations
+        keys = list(param_dict.keys())
+        values = list(param_dict.values())
+        base_combinations = list(itertools.product(*values))
+        
+        # Add focal_gamma only for focal loss
+        for combo in base_combinations:
+            combo_dict = dict(zip(keys, combo))
+            if combo_dict.get("loss") == "focal":
+                for gamma in focal_gammas:
+                    full_combo = combo_dict.copy()
+                    full_combo["focal_gamma"] = gamma
+                    combinations.append(full_combo)
+            else:
+                combinations.append(combo_dict)
+    else:
+        # Normal case: all combinations
+        keys = list(param_dict.keys())
+        values = list(param_dict.values())
+        combos = list(itertools.product(*values))
+        combinations = [dict(zip(keys, combo)) for combo in combos]
+    
+    # Add fixed parameters to each combination
+    experiments = []
+    for combo in combinations:
+        experiment = combo.copy()
         if "fixed_parameters" in config:
-            for param, value in config["fixed_parameters"].items():
-                experiment[param] = value
-                
+            experiment.update(config["fixed_parameters"])
+        
+        # Add experiment name if provided in config
+        if "experiment_name" in config:
+            experiment["experiment_name"] = config["experiment_name"]
+            
         experiments.append(experiment)
     
     console.print(f"[bold green]Generated {len(experiments)} experiment combinations[/bold green]")
     return experiments
 
-def format_command(experiment, experiment_name, wandb_project, use_optimized=False):
+def format_command(experiment, gpu=0):
     """Format a command to run an experiment with the given parameters"""
-    # Choose which script to use
-    script = "train_optimized.py" if use_optimized else "train.py"
+    cmd = ["python", "train.py"]
     
-    cmd = ["python", script]
-    
-    # Add experiment name as a tag
-    if experiment_name:
-        cmd.append(f"--tags={experiment_name}")
+    # Set GPU
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     
     # Add all parameters
     for param, value in experiment.items():
-        cmd.append(f"--{param}={value}")
+        if value is not None:
+            if isinstance(value, bool):
+                if value:
+                    cmd.append(f"--{param}")
+            else:
+                cmd.append(f"--{param}={value}")
     
-    # Add wandb project if specified
-    if wandb_project:
-        os.environ["WANDB_PROJECT"] = wandb_project
-        
-    return cmd
+    return cmd, env
 
-def run_experiment(cmd, verbose=False):
-    """Run a single experiment and capture its output"""
+def run_experiment(cmd, env, experiment_desc):
+    """Run a single experiment"""
     start_time = time.time()
     
     try:
-        if verbose:
-            # Run with live output
-            process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE if not verbose else None,
-                stderr=subprocess.STDOUT if not verbose else None,
-                text=True,
-                bufsize=1
-            )
-            
-            # Wait for process to complete
-            return_code = process.wait()
-            success = return_code == 0
-            
-        else:
-            # Run with captured output
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True
-            )
-            success = result.returncode == 0
+        # Run with real-time output
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
         
+        # Capture key metrics from output
+        last_metrics = {}
+        output_lines = []
+        
+        for line in process.stdout:
+            # Store last 50 lines for error diagnosis
+            output_lines.append(line.strip())
+            if len(output_lines) > 50:
+                output_lines.pop(0)
+                
+            # Print line in real-time
+            print(line.strip())
+            
+            # Look for metric lines
+            if "train_loss:" in line or "val_acc:" in line:
+                # Parse metrics from the line
+                parts = line.strip().split("|")
+                for part in parts:
+                    if ":" in part:
+                        try:
+                            # Split only on first colon to handle time formats
+                            key_value = part.split(":", 1)
+                            if len(key_value) == 2:
+                                key = key_value[0].strip()
+                                value = key_value[1].strip()
+                                # Try to convert to float
+                                try:
+                                    value = float(value)
+                                    last_metrics[key] = value
+                                except ValueError:
+                                    # Not a number, skip
+                                    pass
+                        except Exception as e:
+                            # Skip problematic parts
+                            pass
+        
+        return_code = process.wait()
+        success = return_code == 0
         elapsed = time.time() - start_time
+        
+        # If failed, include last output lines for debugging
+        error_msg = None
+        if not success:
+            error_msg = f"Process exited with code {return_code}. Last output:\n" + "\n".join(output_lines[-10:])
         
         return {
             "success": success,
-            "elapsed_time": elapsed
+            "elapsed_time": elapsed,
+            "metrics": last_metrics,
+            "error": error_msg,
+            "return_code": return_code
         }
         
     except Exception as e:
         return {
             "success": False,
             "error": str(e),
-            "elapsed_time": time.time() - start_time
+            "elapsed_time": time.time() - start_time,
+            "metrics": {},
+            "return_code": -1
         }
 
 def main():
     args = parse_args()
     
-    # Setup signal handler for clean exit
+    # Setup signal handler
     def signal_handler(sig, frame):
         console.print("\n[bold red]Experiment run interrupted. Exiting...[/bold red]")
         sys.exit(0)
-        
     signal.signal(signal.SIGINT, signal_handler)
     
     # Load configuration
     config = load_config(args.config)
     
-    # Generate experiment name if not provided
-    if not args.experiment_name:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.experiment_name = f"exp_{timestamp}"
-    
-    # Generate all experiment combinations
+    # Generate experiments
     experiments = generate_experiment_combinations(config)
     
-    # Print experiment plan
-    console.print(f"[bold green]Running {len(experiments)} experiments for '{args.experiment_name}'[/bold green]")
+    # Display experiment plan
+    exp_name = config.get("experiment_name", "experiment")
+    console.print(f"\n[bold green]Running {len(experiments)} experiments for '{exp_name}'[/bold green]\n")
     
-    exp_table = Table(title="Experiment Configurations")
+    # Show experiment table
+    if len(experiments) <= 20:  # Only show table for reasonable number of experiments
+        table = Table(title="Planned Experiments")
+        
+        # Add columns for varying parameters only
+        varying_params = list(config["parameters"].keys())
+        for param in varying_params:
+            table.add_column(param, style="cyan")
+        
+        # Add rows
+        for exp in experiments:
+            row = [str(exp.get(param, "")) for param in varying_params]
+            table.add_row(*row)
+        
+        console.print(table)
     
-    # Add columns for all parameters
-    for param in config["parameters"].keys():
-        exp_table.add_column(param, style="cyan")
-    
-    # Add rows for each experiment
-    for exp in experiments:
-        exp_table.add_row(*[str(exp[param]) for param in config["parameters"].keys()])
-    
-    console.print(exp_table)
-    
-    # Generate commands for all experiments
-    commands = [format_command(exp, args.experiment_name, args.wandb_project, args.use_optimized) for exp in experiments]
-    
-    # Display command examples
-    if len(commands) > 0:
-        console.print(f"[bold cyan]Example command:[/bold cyan] {' '.join(commands[0])}")
-    
-    # Ask for confirmation unless dry run
-    if not args.dry_run and not args.sequential:
-        response = input(f"\nGenerate {len(commands)} experiment commands? (y/n): ")
+    # Ask for confirmation
+    if not args.dry_run:
+        response = input(f"\nRun {len(experiments)} experiments? (y/n): ")
         if response.lower() != "y":
             console.print("[yellow]Operation cancelled.[/yellow]")
             return
     
-    # Either run experiments or print commands
-    if args.sequential and not args.dry_run:
-        console.print("[bold green]Running experiments sequentially...[/bold green]")
+    # Generate commands
+    commands_and_envs = [format_command(exp, args.gpu) for exp in experiments]
+    
+    if args.dry_run:
+        console.print("\n[bold yellow]Dry run - commands that would be executed:[/bold yellow]\n")
+        for i, (cmd, _) in enumerate(commands_and_envs):
+            console.print(f"[{i+1}] {' '.join(cmd)}")
+        return
+    
+    # Run experiments
+    results = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+    ) as progress:
+        task = progress.add_task("[cyan]Running experiments...", total=len(experiments))
         
-        # Create a progress display
-        layout = Layout()
-        layout.split(
-            Layout(name="progress"),
-            Layout(name="current", size=3)
+        for i, (exp, (cmd, env)) in enumerate(zip(experiments, commands_and_envs)):
+            # Create experiment description
+            varying_values = [f"{k}={exp.get(k)}" for k in config["parameters"].keys() if k in exp]
+            exp_desc = f"Exp {i+1}/{len(experiments)}: {', '.join(varying_values)}"
+            
+            progress.update(task, description=f"[cyan]{exp_desc}[/cyan]")
+            console.print(f"\n[bold]{'='*80}[/bold]")
+            console.print(f"[bold cyan]{exp_desc}[/bold cyan]")
+            console.print(f"[bold]{'='*80}[/bold]\n")
+            
+            # Run experiment
+            result = run_experiment(cmd, env, exp_desc)
+            result["experiment"] = exp_desc
+            results.append(result)
+            
+            # Show result
+            if result["success"]:
+                metrics_str = ", ".join([f"{k}: {v:.4f}" for k, v in result["metrics"].items()])
+                console.print(f"[green]✓ Completed in {result['elapsed_time']:.1f}s - {metrics_str}[/green]")
+            else:
+                console.print(f"[red]✗ Failed after {result['elapsed_time']:.1f}s[/red]")
+                if result.get("error"):
+                    console.print(f"[red]Error: {result['error']}[/red]")
+            
+            progress.update(task, advance=1)
+    
+    # Summary
+    console.print("\n[bold green]Experiment Summary[/bold green]\n")
+    
+    summary_table = Table(title="Results Summary")
+    summary_table.add_column("Experiment", style="cyan")
+    summary_table.add_column("Status", style="green")
+    summary_table.add_column("Time", style="blue")
+    summary_table.add_column("Best Val Acc", style="magenta")
+    
+    successful = 0
+    best_val_acc = 0
+    best_exp = None
+    
+    for result in results:
+        status = "[green]✓[/green]" if result["success"] else "[red]✗[/red]"
+        val_acc = result["metrics"].get("val_acc", 0)
+        
+        summary_table.add_row(
+            result["experiment"],
+            status,
+            f"{result['elapsed_time']:.1f}s",
+            f"{val_acc:.4f}" if val_acc > 0 else "-"
         )
         
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-        ) as progress:
-            # Add main progress task
-            task = progress.add_task("[cyan]Running experiments...", total=len(commands))
-            
-            # Initialize results tracking
-            results = []
-            
-            # Run each experiment
-            for i, cmd in enumerate(commands):
-                # Update the current experiment info
-                experiment_name = f"Experiment {i+1}/{len(commands)}"
-                cmd_str = " ".join(cmd)
-                
-                # Add to layout
-                progress.update(task, description=f"[cyan]Running {experiment_name}[/cyan]")
-                
-                # Display current command
-                console.print(f"\n[bold]{'='*80}[/bold]")
-                console.print(f"[bold cyan]{experiment_name}[/bold cyan]")
-                console.print(f"[bold]Command:[/bold] {cmd_str}")
-                console.print(f"[bold]{'='*80}[/bold]\n")
-                
-                # Run the experiment
-                start_time = time.time()
-                
-                try:
-                    if args.verbose:
-                        # Run with visible output
-                        console.print("[bold yellow]Experiment output:[/bold yellow]")
-                        result = run_experiment(cmd, verbose=True)
-                    else:
-                        # Run with captured output
-                        with console.status(f"[bold green]Running {experiment_name}...[/bold green]"):
-                            result = run_experiment(cmd, verbose=False)
-                    
-                    # Record result
-                    elapsed_time = result.get("elapsed_time", time.time() - start_time)
-                    success = result.get("success", False)
-                    
-                    # Format and display result
-                    if success:
-                        console.print(f"[bold green]✓ {experiment_name} completed successfully in {elapsed_time:.1f} seconds[/bold green]")
-                    else:
-                        error = result.get("error", "Unknown error")
-                        console.print(f"[bold red]✗ {experiment_name} failed after {elapsed_time:.1f} seconds: {error}[/bold red]")
-                    
-                    # Store result
-                    results.append({
-                        "experiment": i+1,
-                        "command": cmd_str,
-                        "success": success,
-                        "elapsed_time": elapsed_time
-                    })
-                    
-                except Exception as e:
-                    console.print(f"[bold red]Error running experiment: {e}[/bold red]")
-                    results.append({
-                        "experiment": i+1,
-                        "command": cmd_str,
-                        "success": False,
-                        "error": str(e),
-                        "elapsed_time": time.time() - start_time
-                    })
-                
-                # Update progress
-                progress.update(task, advance=1)
-                
-            # Display summary
-            console.print("\n[bold green]Experiments completed![/bold green]")
-            
-            # Create results table
-            results_table = Table(title="Experiment Results")
-            results_table.add_column("Experiment", style="cyan")
-            results_table.add_column("Status", style="green")
-            results_table.add_column("Time (s)", style="blue")
-            
-            successful = 0
-            for result in results:
-                status = "[green]✓ Success[/green]" if result["success"] else "[red]✗ Failed[/red]"
-                results_table.add_row(
-                    f"{result['experiment']}/{len(commands)}",
-                    status,
-                    f"{result['elapsed_time']:.1f}"
-                )
-                if result["success"]:
-                    successful += 1
-            
-            console.print(results_table)
-            console.print(f"[bold]Summary:[/bold] {successful}/{len(commands)} experiments completed successfully")
-            
-    else:
-        # Just print the commands so they can be run manually or in parallel
-        console.print("[bold yellow]Commands to run:[/bold yellow]")
-        
-        commands_table = Table(title="Experiment Commands")
-        commands_table.add_column("Experiment", style="cyan")
-        commands_table.add_column("Command", style="green")
-        
-        for i, cmd in enumerate(commands):
-            commands_table.add_row(f"{i+1}", " ".join(cmd))
-        
-        console.print(commands_table)
-        
-        if args.dry_run:
-            console.print("[bold yellow]This was a dry run. No commands were executed.[/bold yellow]")
-        else:
-            console.print("[bold yellow]Copy and paste these commands to run them individually.[/bold yellow]")
+        if result["success"]:
+            successful += 1
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_exp = result["experiment"]
+    
+    console.print(summary_table)
+    console.print(f"\n[bold]Success rate: {successful}/{len(experiments)} ({100*successful/len(experiments):.1f}%)[/bold]")
+    
+    if best_exp:
+        console.print(f"[bold green]Best validation accuracy: {best_val_acc:.4f} ({best_exp})[/bold green]")
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,18 @@
+{
+  "description": "Batch size exploration for optimal training",
+  "experiment_name": "batch_size_exploration",
+  "parameters": {
+    "batch_size": [8, 16, 32, 64, 128],
+    "lr": [0.0001, 0.001, 0.01]
+  },
+  "fixed_parameters": {
+    "model_name": "efficientnet_b0",
+    "loss": "ce",
+    "max_epochs": 30,
+    "early_stopping": 10,
+    "img_size": 224,
+    "num_workers": 4,
+    "optimizer": "adamw",
+    "pretrained": true
+  }
+}
